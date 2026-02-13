@@ -1,0 +1,84 @@
+experiment:
+  name: maia-inspired-phi35-h100
+  date_frozen: "2026-02-13"
+
+configs:
+  C0:
+    name: BF16 baseline
+    precision:
+      weights: bf16
+      activations: bf16
+    runtime: torch
+
+  C1:
+    name: FP8 activations + BF16 weights
+    precision:
+      weights: bf16
+      activations: fp8
+    runtime: torch
+    notes: "Optional on Colab depending on FP8 support stack"
+
+  C2:
+    name: W4A16 (4-bit weights only)
+    precision:
+      weights: w4
+      activations: fp16
+    runtime: torch
+
+  C3:
+    name: W4A8 baseline proxy
+    precision:
+      weights: w4
+      activations: a8
+    runtime: vllm
+    notes: "Proxy framing for H100"
+
+  C4:
+    name: W4A8 + custom shared-scale (method)
+    precision:
+      weights: w4_shared_scale
+      activations: a8
+    runtime: torch
+    custom_scale:
+      enabled: true
+      scale_mbits: 5
+
+  C5:
+    name: W4A8 + custom shared-scale ablation
+    precision:
+      weights: w4_shared_scale
+      activations: a8
+    runtime: torch
+    custom_scale:
+      enabled: true
+      scale_mbits_sweep: [0, 3, 5]
+
+workloads:
+  offline_batch_decode:
+    prompt_lengths: [128, 512, 2048]
+    output_lengths: [64, 256]
+
+  online_serving:
+    concurrency: [1, 4, 8, 16, 32]
+    qps_sweep: true
+
+  long_context_stress:
+    prompts: [8192, 32768]
+    enabled_if_memory_allows: true
+
+metrics:
+  performance:
+    - throughput_output_tok_s
+    - throughput_total_tok_s
+    - ttft_ms_p50
+    - ttft_ms_p95
+    - tpot_ms_p50
+    - tpot_ms_p95
+    - peak_gpu_mem_mb
+    - joules_per_token
+
+  quality:
+    harness: lm-eval
+    tasks: [hellaswag, arc_challenge, gsm8k, lambada_openai]
+    report_relative_drop_vs: C0
+    acceptance_target_avg_relative_drop_pct: 3.0
