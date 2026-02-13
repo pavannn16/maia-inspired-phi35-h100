@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import argparse
 import os
-import time
+import sys
 import uuid
 from typing import Any, Dict
 
 import pandas as pd
 import yaml
 
-from runtime.common import append_jsonl
+
+# Allow running as `python bench/offline_bench.py` (adds repo root to sys.path).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:
@@ -46,7 +50,7 @@ def main() -> None:
 
                 if conf.get("runtime") == "torch":
                     cmd = (
-                        f"python -m runtime.torch_runner --model {args.model} "
+                        f"{sys.executable} -m runtime.torch_runner --model {args.model} "
                         f"--prompt_len {prompt_len} --output_len {output_len} "
                         f"--dtype bf16 --out_jsonl {raw_path} --run_id {sub_id}"
                     )

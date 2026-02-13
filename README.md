@@ -14,7 +14,7 @@ Key honesty statement: **H100 ≠ Maia-200**. H100 has strong **FP8 Tensor Core*
 1. Install deps:
    - `pip install -r requirements.txt`
 2. Run offline sweep (prompt lengths {128,512,2048}, output lengths {64,256}):
-   - `python bench/offline_bench.py --config configs/experiment_matrix.yaml --model microsoft/Phi-3.5-mini-instruct --config_id C0 --repeats 1`
+   - `python -m bench.offline_bench --config configs/experiment_matrix.yaml --model microsoft/Phi-3.5-mini-instruct --config_id C0 --repeats 1`
 
 Artifacts:
 - `results/raw/*.jsonl` (per-request timing + env)

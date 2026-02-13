@@ -3,10 +3,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import subprocess
 from typing import Any, Dict, List
 
 import yaml
+
+
+# Allow running as `python eval/lm_eval_runner.py` (adds repo root to sys.path).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:
