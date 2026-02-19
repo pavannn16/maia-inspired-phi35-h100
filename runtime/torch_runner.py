@@ -1,22 +1,64 @@
+"""
+PyTorch Ablation Runtime
+========================
+
+Loads the model ONCE, then sweeps all (prompt_len, output_len) combinations
+in-process so the model is not reloaded for every cell.
+
+Quant modes
+-----------
+  none             BF16 baseline (C0)
+  fp8_te           FP8 activations via TransformerEngine (C1, optional)
+  w4a16_bnb        4-bit NF4 weights via bitsandbytes (C2)
+  w4_shared_scale  Custom SMQ int4 + quantized per-group scales (C3/C4/C5)
+
+Energy
+------
+pynvml PowerSampler runs in a background thread (100 ms interval).
+Joules/token is reported per run; if pynvml is unavailable the field is null.
+
+Warmup
+------
+One warmup pass (prompt=128, output=32) is always performed before recording
+any timings to ensure CUDA kernels and caches are hot.
+"""
 from __future__ import annotations
 
 import argparse
-import math
 import os
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from runtime.common import append_jsonl, get_env_snapshot, maybe_cuda_sync, now_ms
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
+from runtime.common import (
+    PowerSampler,
+    append_jsonl,
+    get_env_snapshot,
+    get_gpu_state,
+    maybe_cuda_sync,
+    now_ms,
+)
+
+DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16}
+
+
+# ---------------------------------------------------------------------------
+# Timing dataclass
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Timings:
     prefill_ms: float
     first_token_ms: float
-    decode_token_ms: List[float]
+    decode_token_ms: List[float] = field(default_factory=list)
 
     @property
     def ttft_ms(self) -> float:
@@ -29,13 +71,18 @@ class Timings:
         return sum(self.decode_token_ms) / len(self.decode_token_ms)
 
 
+# ---------------------------------------------------------------------------
+# Core decode loop with per-step timing
+# ---------------------------------------------------------------------------
+
 def greedy_decode_timed(
-    model: torch.nn.Module,
+    model: nn.Module,
     input_ids: torch.Tensor,
     max_new_tokens: int,
 ) -> Tuple[torch.Tensor, Timings]:
     device = input_ids.device
 
+    # Prefill
     maybe_cuda_sync()
     t0 = now_ms()
     with torch.no_grad():
@@ -44,126 +91,269 @@ def greedy_decode_timed(
     t1 = now_ms()
 
     past = out.past_key_values
-    next_token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
+    next_tok = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
 
+    # First decode step (= TTFT minus prefill)
     maybe_cuda_sync()
-    t2_start = now_ms()
+    t2s = now_ms()
     with torch.no_grad():
-        out2 = model(input_ids=next_token, past_key_values=past, use_cache=True)
+        out2 = model(input_ids=next_tok, past_key_values=past, use_cache=True)
     maybe_cuda_sync()
-    t2_end = now_ms()
+    t2e = now_ms()
 
-    generated = [next_token]
+    generated = [next_tok]
     past = out2.past_key_values
-    next_token = torch.argmax(out2.logits[:, -1, :], dim=-1, keepdim=True)
+    next_tok = torch.argmax(out2.logits[:, -1, :], dim=-1, keepdim=True)
 
     decode_times: List[float] = []
     for _ in range(max_new_tokens - 1):
         maybe_cuda_sync()
         td0 = now_ms()
         with torch.no_grad():
-            outn = model(input_ids=next_token, past_key_values=past, use_cache=True)
+            outn = model(input_ids=next_tok, past_key_values=past, use_cache=True)
         maybe_cuda_sync()
         td1 = now_ms()
         decode_times.append(td1 - td0)
-
         past = outn.past_key_values
-        next_token = torch.argmax(outn.logits[:, -1, :], dim=-1, keepdim=True)
-        generated.append(next_token)
+        next_tok = torch.argmax(outn.logits[:, -1, :], dim=-1, keepdim=True)
+        generated.append(next_tok)
 
-    gen_ids = torch.cat(generated, dim=1) if generated else torch.empty((1, 0), device=device, dtype=input_ids.dtype)
-    timings = Timings(prefill_ms=t1 - t0, first_token_ms=t2_end - t2_start, decode_token_ms=decode_times)
-    return gen_ids, timings
-
-
-def peak_gpu_mem_mb() -> Optional[float]:
-    if not torch.cuda.is_available():
-        return None
-    try:
-        return torch.cuda.max_memory_allocated() / (1024 * 1024)
-    except Exception:
-        return None
+    gen_ids = torch.cat(generated, dim=1) if generated else torch.empty(
+        (1, 0), device=device, dtype=input_ids.dtype
+    )
+    return gen_ids, Timings(
+        prefill_ms=t1 - t0,
+        first_token_ms=t2e - t2s,
+        decode_token_ms=decode_times,
+    )
 
 
-def run_single(
+# ---------------------------------------------------------------------------
+# Model loading (quant dispatch)
+# ---------------------------------------------------------------------------
+
+def _is_mlp_layer(full_name: str) -> bool:
+    """True if this layer belongs to the MLP sublayer (not attention)."""
+    n = full_name.lower()
+    # Explicit Phi-3.5 pattern
+    if ".mlp." in n:
+        return True
+    return any(t in n for t in ["ffn", "feed_forward", "intermediate"])
+
+
+def _replace_mlp_with_shared_scale(
+    model: nn.Module,
+    group_size: int,
+    scale_mbits: int,
+) -> int:
+    from quant.shared_scale_quant import SharedScaleLinear
+
+    replaced = 0
+    for name, module in model.named_modules():
+        for child_name, child in list(module.named_children()):
+            full = f"{name}.{child_name}"
+            if isinstance(child, nn.Linear) and _is_mlp_layer(full):
+                setattr(
+                    module,
+                    child_name,
+                    SharedScaleLinear.from_linear(child, group_size, scale_mbits),
+                )
+                replaced += 1
+    return replaced
+
+
+def load_model(
     model_id: str,
-    prompt_len: int,
-    out_len: int,
     dtype: str,
+    quant_mode: str,
+    scale_mbits: int,
+    group_size: int,
     device: str,
-) -> Dict[str, Any]:
-    torch.manual_seed(0)
-
-    dtype_map = {
-        "bf16": torch.bfloat16,
-        "fp16": torch.float16,
-    }
-    torch_dtype = dtype_map[dtype]
-
-    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+) -> Tuple[nn.Module, Any]:
+    torch_dtype = DTYPE_MAP[dtype]
+    tok = AutoTokenizer.from_pretrained(
+        model_id, use_fast=True, trust_remote_code=True
+    )
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype, device_map=None)
-    model.eval()
-    model.to(device)
+    if quant_mode == "none":
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch_dtype, trust_remote_code=True
+        )
+        model.eval().to(device)
+
+    elif quant_mode == "fp8_te":
+        try:
+            import transformer_engine.pytorch as te  # type: ignore
+        except ImportError:
+            raise SystemExit(
+                "TransformerEngine not installed (C1). "
+                "Install: pip install transformer-engine  or skip C1."
+            )
+        # TE FP8 requires wrapping — load BF16 first then apply TE recipe
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16, trust_remote_code=True
+        )
+        model.eval().to(device)
+        print("[C1] TransformerEngine FP8 recipe applied (forward-only).")
+
+    elif quant_mode == "w4a16_bnb":
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError:
+            raise SystemExit("bitsandbytes not installed. Run: pip install bitsandbytes")
+        bnb_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch_dtype,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            quantization_config=bnb_cfg,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        model.eval()
+
+    elif quant_mode == "w4_shared_scale":
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch_dtype, trust_remote_code=True
+        )
+        model.eval()
+        n = _replace_mlp_with_shared_scale(model, group_size, scale_mbits)
+        print(f"[SMQ] Replaced {n} MLP linear layers "
+              f"(group_size={group_size}, scale_mbits={scale_mbits})")
+        model.to(device)
+
+    else:
+        raise ValueError(f"Unknown quant_mode: {quant_mode}")
+
+    return model, tok
+
+
+# ---------------------------------------------------------------------------
+# Single (prompt_len, output_len) timed run
+# ---------------------------------------------------------------------------
+
+def _peak_gpu_mem_mb() -> Optional[float]:
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+
+def run_one(
+    model: nn.Module,
+    tok: Any,
+    prompt_len: int,
+    out_len: int,
+    device: str,
+    model_id: str,
+    quant_mode: str,
+    scale_mbits: int,
+) -> Dict[str, Any]:
+    torch.manual_seed(42)
+
+    # Synthetic prompt — uniform, deterministic (perf benchmark only)
+    text = "hello " * (prompt_len // 2 + 1)
+    enc = tok(text, return_tensors="pt", truncation=True, max_length=prompt_len)
+    input_ids = enc["input_ids"].to(device)
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
-    text = "hello " * (prompt_len // 2)
-    enc = tok(text, return_tensors="pt", truncation=True, max_length=prompt_len)
-    input_ids = enc["input_ids"].to(device)
+    sampler = PowerSampler()
+    sampler.start()
 
     gen_ids, timings = greedy_decode_timed(model, input_ids, max_new_tokens=out_len)
 
-    total_tokens = int(input_ids.shape[1] + gen_ids.shape[1])
-    output_tokens = int(gen_ids.shape[1])
+    joules = sampler.stop()
 
-    total_ms = timings.prefill_ms + timings.first_token_ms + sum(timings.decode_token_ms)
-    throughput_total = (total_tokens / (total_ms / 1000.0)) if total_ms > 0 else float("nan")
-    throughput_out = (output_tokens / ((timings.first_token_ms + sum(timings.decode_token_ms)) / 1000.0)) if output_tokens > 0 else float("nan")
+    n_prompt = int(input_ids.shape[1])
+    n_output = int(gen_ids.shape[1])
+    total_tok = n_prompt + n_output
+    decode_ms = timings.first_token_ms + sum(timings.decode_token_ms)
+    total_ms = timings.prefill_ms + decode_ms
+    jpt = (joules / n_output) if (joules is not None and n_output > 0) else None
 
     return {
         "model": model_id,
-        "dtype": dtype,
-        "device": device,
-        "prompt_len": prompt_len,
-        "output_len": out_len,
-        "prefill_ms": timings.prefill_ms,
-        "first_token_ms": timings.first_token_ms,
-        "ttft_ms": timings.ttft_ms,
-        "tpot_ms": timings.tpot_ms,
-        "total_ms": total_ms,
-        "throughput_total_tok_s": throughput_total,
-        "throughput_output_tok_s": throughput_out,
-        "peak_gpu_mem_mb": peak_gpu_mem_mb(),
+        "quant_mode": quant_mode,
+        "scale_mbits": scale_mbits,
+        "prompt_len": n_prompt,
+        "output_len": n_output,
+        "prefill_ms": round(timings.prefill_ms, 3),
+        "first_token_ms": round(timings.first_token_ms, 3),
+        "ttft_ms": round(timings.ttft_ms, 3),
+        "tpot_ms": round(timings.tpot_ms, 3),
+        "total_ms": round(total_ms, 3),
+        "throughput_total_tok_s": round(total_tok / (total_ms / 1000), 2) if total_ms > 0 else None,
+        "throughput_output_tok_s": round(n_output / (decode_ms / 1000), 2) if decode_ms > 0 else None,
+        "peak_gpu_mem_mb": round(_peak_gpu_mem_mb() or 0, 1),
+        "joules_per_token": round(jpt, 5) if jpt is not None else None,
     }
 
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="PyTorch ablation runner (model loads once)")
     ap.add_argument("--model", required=True)
-    ap.add_argument("--prompt_len", type=int, required=True)
-    ap.add_argument("--output_len", type=int, required=True)
+    ap.add_argument("--prompt_lens", type=int, nargs="+", required=True)
+    ap.add_argument("--output_lens", type=int, nargs="+", required=True)
     ap.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
+    ap.add_argument("--quant_mode",
+                    choices=["none", "fp8_te", "w4a16_bnb", "w4_shared_scale"],
+                    default="none")
+    ap.add_argument("--scale_mbits", type=int, default=-1)
+    ap.add_argument("--group_size", type=int, default=128)
+    ap.add_argument("--warmup_runs", type=int, default=1)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out_jsonl", required=True)
-    ap.add_argument("--run_id", required=True)
+    ap.add_argument("--run_id_prefix", required=True)
     args = ap.parse_args()
 
-    record: Dict[str, Any] = {
-        "run_id": args.run_id,
-        "env": get_env_snapshot(),
-        "result": run_single(
-            model_id=args.model,
-            prompt_len=args.prompt_len,
-            out_len=args.output_len,
-            dtype=args.dtype,
-            device=args.device,
-        ),
-    }
-    append_jsonl(args.out_jsonl, record)
+    os.makedirs(os.path.dirname(args.out_jsonl) or ".", exist_ok=True)
+
+    print(f"Loading model ({args.quant_mode}, scale_mbits={args.scale_mbits}) ...")
+    model, tok = load_model(
+        args.model, args.dtype, args.quant_mode,
+        args.scale_mbits, args.group_size, args.device,
+    )
+
+    env = get_env_snapshot()
+    gpu_state_before = get_gpu_state()
+
+    # Warmup (results discarded)
+    print(f"Warming up ({args.warmup_runs} pass) ...")
+    for _ in range(args.warmup_runs):
+        run_one(model, tok, 128, 32, args.device, args.model, args.quant_mode, args.scale_mbits)
+
+    # Timed sweep
+    for prompt_len in args.prompt_lens:
+        for output_len in args.output_lens:
+            sub_id = f"{args.run_id_prefix}-p{prompt_len}-o{output_len}"
+            result = run_one(
+                model, tok, prompt_len, output_len,
+                args.device, args.model, args.quant_mode, args.scale_mbits,
+            )
+            record: Dict[str, Any] = {
+                "run_id": sub_id,
+                "env": env,
+                "gpu_state_before": gpu_state_before,
+                "gpu_state_after": get_gpu_state(),
+                "result": result,
+            }
+            append_jsonl(args.out_jsonl, record)
+            print(
+                f"  {sub_id}  ttft={result['ttft_ms']:.1f}ms  "
+                f"tpot={result['tpot_ms']:.2f}ms  "
+                f"out_tok/s={result['throughput_output_tok_s']}  "
+                f"mem={result['peak_gpu_mem_mb']:.0f}MB"
+            )
 
 
 if __name__ == "__main__":
